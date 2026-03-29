@@ -3,11 +3,15 @@ from config import settings
 
 class BotState:
     def __init__(self):
-        self._lock          = threading.Lock()
-        self.is_running     = False
-        self.leverage       = 125          # Default up to 125x agresif
-        self.margin_mode    = 'cross'
-        self.risk_per_trade = settings.RISK_PER_TRADE
+        self._lock            = threading.Lock()
+        self.is_running       = False
+
+        # FIX: Leverage diturunkan ke 20x (aman untuk scalping multi-pair)
+        # FIX: Margin mode diubah ke isolated (melindungi akun dari likuidasi berantai)
+        self.leverage         = 20
+        self.margin_mode      = 'isolated'
+
+        self.risk_per_trade   = settings.RISK_PER_TRADE
         self.settings_changed = True
 
     @property
@@ -25,7 +29,7 @@ class BotState:
 
     def set_leverage(self, value):
         with self._lock:
-            self.leverage       = value
+            self.leverage         = value
             self.settings_changed = True
 
     def get_snapshot(self):

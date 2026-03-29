@@ -524,9 +524,11 @@ def dashboard_updater_loop():
         except Exception as e:
             time.sleep(2)
 
-# ==========================================
-# TRADING ENGINE (FAST SCALPING MODE)
-# ==========================================
+# =====================================================================
+# PATCH untuk main.py — ganti fungsi trading_loop() yang lama
+# dengan versi ini. Semua bagian lain di main.py tidak perlu diubah.
+# =====================================================================
+
 def trading_loop():
     ex    = GateioExchange()
     ind   = MarketIndicators()
@@ -542,55 +544,79 @@ def trading_loop():
 
         try:
             state = bot_state.get_snapshot()
-            
+
             if state['settings_changed']:
                 for sym in settings.SYMBOLS:
                     ex.apply_account_settings(sym, state['leverage'], state['margin_mode'])
                 bot_state.mark_settings_applied()
 
             tracked_positions = monitor_positions_for_alerts(ex, tracked_positions)
-            tracked_symbols = [p.get('symbol') for p in tracked_positions]
+            tracked_symbols   = {p.get('symbol') for p in tracked_positions}
 
             if len(tracked_positions) >= settings.MAX_POSITIONS:
-                time.sleep(5)
+                time.sleep(3)
                 continue
 
             for symbol in settings.SYMBOLS:
                 if symbol in tracked_symbols:
                     continue
-                
-                df = ex.get_ohlcv(symbol, settings.TIMEFRAME)
-                df = ind.apply_indicators(df)
-                ob = ex.get_orderbook(symbol)
 
+                df = ex.get_ohlcv(symbol, settings.TIMEFRAME, limit=300)
+                df = ind.apply_indicators(df)
+
+                if df.empty:
+                    continue
+
+                ob = ex.get_orderbook(symbol)
                 signal, price, atr, analysis_txt = strat.generate_signal(df, ob)
 
+                logger.info(f"[{symbol}] {analysis_txt}")
+
                 if signal:
-                    sl, tp = risk.calculate_sl_tp(signal, price, atr)
-                    size   = risk.calculate_position_size(symbol, price, sl, state['risk_per_trade'])
+                    sl, tp   = risk.calculate_sl_tp(signal, price, atr)
+                    size     = risk.calculate_position_size(
+                        symbol, price, sl, state['risk_per_trade']
+                    )
 
                     if size > 0:
                         order = ex.create_order(symbol, 'market', signal, size)
                         if order:
-                            ex.create_sl_tp_orders(symbol, signal, size, sl, tp)
+                            sl_ok, tp_ok = ex.create_sl_tp_orders(symbol, signal, size, sl, tp)
+
                             notional = size * ex.get_market_info(symbol)['contract_size'] * price
 
+                            # FIX: Peringatkan jika SL/TP gagal ditempatkan
+                            sl_status = "✅" if sl_ok else "❌ GAGAL"
+                            tp_status = "✅" if tp_ok else "❌ GAGAL"
+
                             send_telegram_alert(
-                                f"🚀 <b>FAST SCALP MASUK</b>\n"
+                                f"🚀 <b>SCALP ENTRY</b>\n"
                                 f"Pair : <code>{symbol}</code>\n"
                                 f"Tipe : <b>{'LONG 📈' if signal == 'buy' else 'SHORT 📉'}</b>\n"
-                                f"Size : {size} (Notional {notional:.2f} USDT)\n"
-                                f"🛑 SL: {sl:.4f} | ✅ TP: {tp:.4f}"
+                                f"Size : {size} (Notional ~{notional:.2f} USDT)\n"
+                                f"🛑 SL: {sl:.4f} [{sl_status}]\n"
+                                f"✅ TP: {tp:.4f} [{tp_status}]\n"
+                                f"📊 {analysis_txt}"
                             )
-                            tracked_positions = ex.get_all_open_positions()
-                            tracked_symbols = [p.get('symbol') for p in tracked_positions]
-                            
-                            if len(tracked_positions) >= settings.MAX_POSITIONS:
-                                break 
-                            time.sleep(2) 
 
-            time.sleep(5) 
-            
+                            # Jika SL gagal, kirim alert kritis terpisah
+                            if not sl_ok:
+                                send_telegram_alert(
+                                    f"⚠️ <b>PERINGATAN KRITIS</b>\n"
+                                    f"SL untuk <code>{symbol}</code> <b>GAGAL ditempatkan!</b>\n"
+                                    f"Posisi berjalan tanpa proteksi. Monitor manual!"
+                                )
+
+                            tracked_positions = ex.get_all_open_positions()
+                            tracked_symbols   = {p.get('symbol') for p in tracked_positions}
+
+                            if len(tracked_positions) >= settings.MAX_POSITIONS:
+                                break
+
+                            time.sleep(1)  # Jeda 1 detik antar order (lebih cepat dari sebelumnya)
+
+            time.sleep(3)  # Loop setiap 3 detik (lebih cepat dari 5 detik sebelumnya)
+
         except Exception as e:
             logger.error(f"Error di Trading Loop: {e}")
             time.sleep(5)

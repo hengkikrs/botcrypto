@@ -525,9 +525,117 @@ def dashboard_updater_loop():
             time.sleep(2)
 
 # =====================================================================
-# PATCH untuk main.py — ganti fungsi trading_loop() yang lama
-# dengan versi ini. Semua bagian lain di main.py tidak perlu diubah.
+# PATCH v2 untuk main.py — ganti fungsi trading_loop() yang lama
+# dengan versi ini. Tambahkan juga import berikut di bagian atas main.py
+# jika belum ada:
+#
+#   import time
+#   import threading
+#   from concurrent.futures import ThreadPoolExecutor, as_completed
+#
+# Semua bagian lain di main.py tidak perlu diubah.
 # =====================================================================
+
+# ── State dinamis untuk daftar pair (thread-safe) ─────────────────────
+_symbols_lock    = threading.Lock()
+_active_symbols  = []        # diisi saat startup, di-refresh tiap 1 jam
+_symbols_last_refresh = 0    # timestamp refresh terakhir
+
+def _refresh_symbols_if_needed(ex):
+    """
+    Refresh daftar top N pair jika:
+    - Pertama kali (belum ada pair)
+    - Sudah lewat SYMBOL_REFRESH_INTERVAL detik sejak refresh terakhir
+
+    Thread-safe: hanya 1 thread yang boleh refresh pada satu waktu.
+    """
+    global _active_symbols, _symbols_last_refresh
+
+    now     = time.time()
+    elapsed = now - _symbols_last_refresh
+
+    if settings.SYMBOL_MODE != "AUTO":
+        with _symbols_lock:
+            _active_symbols = list(settings.SYMBOLS)
+        return
+
+    need_refresh = (len(_active_symbols) == 0 or
+                    elapsed >= settings.SYMBOL_REFRESH_INTERVAL)
+
+    if not need_refresh:
+        return
+
+    logger.info(f"🔄 Refresh daftar pair (interval: {settings.SYMBOL_REFRESH_INTERVAL}s)...")
+    new_symbols = ex.get_top_symbols(top_n=settings.TOP_N_SYMBOLS)
+
+    if new_symbols:
+        with _symbols_lock:
+            _active_symbols      = new_symbols
+            _symbols_last_refresh = now
+
+        send_telegram_alert(
+            f"🔄 <b>Pair List Diperbarui</b>\n"
+            f"Top {len(new_symbols)} pair by volume:\n"
+            f"<code>{', '.join([s.split('/')[0] for s in new_symbols])}</code>"
+        )
+    else:
+        # Fallback ke SYMBOLS manual jika fetch gagal
+        logger.warning("⚠️ Gagal fetch top symbols, fallback ke SYMBOLS manual")
+        with _symbols_lock:
+            _active_symbols = list(settings.SYMBOLS)
+
+
+def _get_active_symbols():
+    """Ambil snapshot daftar pair aktif secara thread-safe."""
+    with _symbols_lock:
+        return list(_active_symbols)
+
+
+def _scan_symbol(ex, ind, strat, risk, symbol, state):
+    """
+    Scan satu pair: fetch OHLCV → hitung indikator → generate signal.
+    Dijalankan paralel oleh ThreadPoolExecutor.
+    Return dict hasil atau None jika tidak ada sinyal.
+    """
+    try:
+        df = ex.get_ohlcv(symbol, settings.TIMEFRAME, limit=300)
+        df = ind.apply_indicators(df)
+
+        if df.empty:
+            return None
+
+        ob = ex.get_orderbook(symbol)
+        signal, price, atr, analysis_txt = strat.generate_signal(df, ob)
+
+        logger.info(f"[{symbol.split('/')[0]}] {analysis_txt}")
+
+        if not signal:
+            return None
+
+        sl, tp = risk.calculate_sl_tp(signal, price, atr)
+        size   = risk.calculate_position_size(
+            symbol, price, sl, state['risk_per_trade']
+        )
+
+        if size <= 0:
+            logger.warning(f"[{symbol}] Size=0, skip entry")
+            return None
+
+        return {
+            'symbol':       symbol,
+            'signal':       signal,
+            'price':        price,
+            'atr':          atr,
+            'sl':           sl,
+            'tp':           tp,
+            'size':         size,
+            'analysis_txt': analysis_txt,
+        }
+
+    except Exception as e:
+        logger.error(f"_scan_symbol error [{symbol}]: {e}")
+        return None
+
 
 def trading_loop():
     ex    = GateioExchange()
@@ -537,6 +645,10 @@ def trading_loop():
 
     tracked_positions = ex.get_all_open_positions()
 
+    # Jumlah worker thread paralel.
+    # 10 worker = scan 20 pair dalam ~2 batch, cukup cepat tanpa spam rate limit
+    MAX_WORKERS = 10
+
     while True:
         if not bot_state.running:
             time.sleep(5)
@@ -545,77 +657,121 @@ def trading_loop():
         try:
             state = bot_state.get_snapshot()
 
+            # ── Apply leverage/margin jika ada perubahan settings ─────────
             if state['settings_changed']:
-                for sym in settings.SYMBOLS:
+                symbols_now = _get_active_symbols() or list(settings.SYMBOLS)
+                for sym in symbols_now:
                     ex.apply_account_settings(sym, state['leverage'], state['margin_mode'])
                 bot_state.mark_settings_applied()
 
+            # ── Refresh daftar pair jika perlu ───────────────────────────
+            _refresh_symbols_if_needed(ex)
+            active_symbols = _get_active_symbols()
+
+            if not active_symbols:
+                logger.warning("Daftar pair kosong, menunggu...")
+                time.sleep(10)
+                continue
+
+            # ── Monitor posisi yang sudah ditutup ─────────────────────────
             tracked_positions = monitor_positions_for_alerts(ex, tracked_positions)
             tracked_symbols   = {p.get('symbol') for p in tracked_positions}
 
-            if len(tracked_positions) >= settings.MAX_POSITIONS:
+            open_count = len(tracked_positions)
+            if open_count >= settings.MAX_POSITIONS:
+                logger.info(f"Max posisi tercapai ({open_count}/{settings.MAX_POSITIONS}), skip scan")
                 time.sleep(3)
                 continue
 
-            for symbol in settings.SYMBOLS:
+            # ── Filter pair yang belum punya posisi terbuka ───────────────
+            symbols_to_scan = [s for s in active_symbols if s not in tracked_symbols]
+            slot_tersisa    = settings.MAX_POSITIONS - open_count
+
+            if not symbols_to_scan:
+                time.sleep(3)
+                continue
+
+            logger.info(
+                f"🔍 Scanning {len(symbols_to_scan)} pair "
+                f"| Slot terbuka: {slot_tersisa} "
+                f"| Workers: {MAX_WORKERS}"
+            )
+
+            # ── Concurrent scan semua pair paralel ────────────────────────
+            hasil_sinyal = []
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(_scan_symbol, ex, ind, strat, risk, sym, state): sym
+                    for sym in symbols_to_scan
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        hasil_sinyal.append(result)
+
+            # ── Eksekusi sinyal (maksimal sesuai slot tersisa) ────────────
+            # Urutkan: prioritaskan sinyal dari pair dengan volume tertinggi
+            # (urutan di active_symbols sudah sorted by volume)
+            hasil_sinyal.sort(
+                key=lambda x: active_symbols.index(x['symbol'])
+                if x['symbol'] in active_symbols else 999
+            )
+
+            entry_count = 0
+            for hasil in hasil_sinyal:
+                if entry_count >= slot_tersisa:
+                    break
+
+                symbol      = hasil['symbol']
+                signal      = hasil['signal']
+                size        = hasil['size']
+                sl          = hasil['sl']
+                tp          = hasil['tp']
+                price       = hasil['price']
+                analysis    = hasil['analysis_txt']
+
+                # Cek ulang posisi terbuka (mungkin sudah berubah sejak scan)
+                tracked_positions = ex.get_all_open_positions()
+                tracked_symbols   = {p.get('symbol') for p in tracked_positions}
+
                 if symbol in tracked_symbols:
                     continue
+                if len(tracked_positions) >= settings.MAX_POSITIONS:
+                    break
 
-                df = ex.get_ohlcv(symbol, settings.TIMEFRAME, limit=300)
-                df = ind.apply_indicators(df)
-
-                if df.empty:
+                order = ex.create_order(symbol, 'market', signal, size)
+                if not order:
                     continue
 
-                ob = ex.get_orderbook(symbol)
-                signal, price, atr, analysis_txt = strat.generate_signal(df, ob)
+                sl_ok, tp_ok = ex.create_sl_tp_orders(symbol, signal, size, sl, tp)
 
-                logger.info(f"[{symbol}] {analysis_txt}")
+                market_info = ex.get_market_info(symbol)
+                notional    = size * market_info['contract_size'] * price
 
-                if signal:
-                    sl, tp   = risk.calculate_sl_tp(signal, price, atr)
-                    size     = risk.calculate_position_size(
-                        symbol, price, sl, state['risk_per_trade']
+                sl_status = "✅" if sl_ok else "❌ GAGAL"
+                tp_status = "✅" if tp_ok else "❌ GAGAL"
+
+                send_telegram_alert(
+                    f"🚀 <b>SCALP ENTRY</b>\n"
+                    f"Pair : <code>{symbol}</code>\n"
+                    f"Tipe : <b>{'LONG 📈' if signal == 'buy' else 'SHORT 📉'}</b>\n"
+                    f"Size : {size} (Notional ~{notional:.2f} USDT)\n"
+                    f"🛑 SL: {sl:.4f} [{sl_status}]\n"
+                    f"✅ TP: {tp:.4f} [{tp_status}]\n"
+                    f"📊 {analysis}"
+                )
+
+                if not sl_ok:
+                    send_telegram_alert(
+                        f"⚠️ <b>PERINGATAN KRITIS</b>\n"
+                        f"SL untuk <code>{symbol}</code> <b>GAGAL!</b>\n"
+                        f"Posisi berjalan tanpa proteksi. Monitor manual!"
                     )
 
-                    if size > 0:
-                        order = ex.create_order(symbol, 'market', signal, size)
-                        if order:
-                            sl_ok, tp_ok = ex.create_sl_tp_orders(symbol, signal, size, sl, tp)
+                entry_count += 1
+                time.sleep(0.5)  # Jeda kecil antar order
 
-                            notional = size * ex.get_market_info(symbol)['contract_size'] * price
-
-                            # FIX: Peringatkan jika SL/TP gagal ditempatkan
-                            sl_status = "✅" if sl_ok else "❌ GAGAL"
-                            tp_status = "✅" if tp_ok else "❌ GAGAL"
-
-                            send_telegram_alert(
-                                f"🚀 <b>SCALP ENTRY</b>\n"
-                                f"Pair : <code>{symbol}</code>\n"
-                                f"Tipe : <b>{'LONG 📈' if signal == 'buy' else 'SHORT 📉'}</b>\n"
-                                f"Size : {size} (Notional ~{notional:.2f} USDT)\n"
-                                f"🛑 SL: {sl:.4f} [{sl_status}]\n"
-                                f"✅ TP: {tp:.4f} [{tp_status}]\n"
-                                f"📊 {analysis_txt}"
-                            )
-
-                            # Jika SL gagal, kirim alert kritis terpisah
-                            if not sl_ok:
-                                send_telegram_alert(
-                                    f"⚠️ <b>PERINGATAN KRITIS</b>\n"
-                                    f"SL untuk <code>{symbol}</code> <b>GAGAL ditempatkan!</b>\n"
-                                    f"Posisi berjalan tanpa proteksi. Monitor manual!"
-                                )
-
-                            tracked_positions = ex.get_all_open_positions()
-                            tracked_symbols   = {p.get('symbol') for p in tracked_positions}
-
-                            if len(tracked_positions) >= settings.MAX_POSITIONS:
-                                break
-
-                            time.sleep(1)  # Jeda 1 detik antar order (lebih cepat dari sebelumnya)
-
-            time.sleep(3)  # Loop setiap 3 detik (lebih cepat dari 5 detik sebelumnya)
+            time.sleep(3)  # Loop utama setiap 3 detik
 
         except Exception as e:
             logger.error(f"Error di Trading Loop: {e}")
